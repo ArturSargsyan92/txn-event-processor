@@ -125,12 +125,16 @@ async def session_factory(
 
 @pytest.fixture
 async def redis(settings: Settings) -> AsyncIterator[Redis]:
-    """A real, connected Redis client — flushed (FLUSHDB) after each test.
+    """A real, connected Redis client — flushed (FLUSHDB) before and after each test.
 
     Needs a reachable Redis: point APP_REDIS_URL at a *dedicated test db index* — this
     fixture wipes the whole database it's pointed at. Skips with a clear reason if nothing is
     reachable, so `uv run pytest` still runs everywhere; only the tests that need a real queue
     are skipped.
+
+    Flushing before the test, not just after, makes this self-healing: a run interrupted mid-
+    test (Ctrl-C, a crash) skips its own teardown, and without a pre-flush too the next run
+    would start against a stale group/stream and fail confusingly.
     """
     client = create_redis(settings.redis_url)
     try:
@@ -139,6 +143,7 @@ async def redis(settings: Settings) -> AsyncIterator[Redis]:
         await client.aclose()
         pytest.skip(f"no Redis reachable at {settings.redis_url!r}: {exc}")
 
+    await client.flushdb()
     try:
         yield client
     finally:

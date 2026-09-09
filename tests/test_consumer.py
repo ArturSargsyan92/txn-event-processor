@@ -101,6 +101,27 @@ async def test_claim_stale_reclaims_idle_message(redis: Redis, consumer: StreamC
     assert reclaimed[0].msg_id == msg_id
 
 
+async def test_claim_stale_respects_min_idle_ms(redis: Redis, consumer: StreamConsumer):
+    """A message delivered moments ago isn't stale — a large min_idle_ms must reclaim
+    nothing, not just "some low number of milliseconds" that a 0 in the other tests can't
+    distinguish from a unit mix-up (seconds vs. milliseconds)."""
+    await consumer.ensure_group()
+    await _publish(redis, _event())
+    await consumer.read()
+
+    reclaimed = await consumer.claim_stale(min_idle_ms=60_000)
+
+    assert reclaimed == []
+
+
+async def test_read_returns_empty_list_when_nothing_published(consumer: StreamConsumer):
+    await consumer.ensure_group()
+
+    messages = await consumer.read()
+
+    assert messages == []
+
+
 async def test_claim_stale_reports_delivery_count(redis: Redis, consumer: StreamConsumer):
     await consumer.ensure_group()
     await _publish(redis, _event())
@@ -129,10 +150,24 @@ async def test_dead_letter_writes_to_dlq_and_acks(redis: Redis, consumer: Stream
     assert pending["pending"] == 0
 
 
-async def test_unparseable_payload_is_dead_lettered(redis: Redis, consumer: StreamConsumer):
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        pytest.param({"schema_version": "1"}, id="missing_payload_field"),
+        pytest.param({"schema_version": "1", "payload": "not valid json {"}, id="malformed_json"),
+        pytest.param(
+            {"schema_version": "1", "payload": '{"id": "t1"}'}, id="fails_event_validation"
+        ),
+    ],
+)
+async def test_unparseable_payload_is_dead_lettered(
+    redis: Redis, consumer: StreamConsumer, bad_fields: dict[str, str]
+):
+    """Three distinct ways an entry can be unparseable: a missing field (KeyError), broken
+    JSON, and JSON that parses but doesn't satisfy TransactionEvent (both the latter surface
+    as ValueError — json.JSONDecodeError and pydantic's ValidationError both are)."""
     await consumer.ensure_group()
-    # Missing the "payload" field entirely — StreamEnvelope.from_fields can't rebuild this.
-    bad_id = await redis.xadd(STREAM, {"schema_version": "1"})
+    await redis.xadd(STREAM, bad_fields)
 
     messages = await consumer.read()
 
@@ -143,7 +178,6 @@ async def test_unparseable_payload_is_dead_lettered(redis: Redis, consumer: Stre
 
     pending = await redis.xpending(STREAM, GROUP)
     assert pending["pending"] == 0
-    assert bad_id  # published id is real; just documents what we dead-lettered
 
 
 async def test_lag_reports_undelivered_entries(redis: Redis):
@@ -167,3 +201,15 @@ async def test_lag_reports_undelivered_entries(redis: Redis):
     await consumer.read()  # delivers exactly one (unacked); lag counts delivery, not ack
 
     assert await consumer.lag() == 2
+
+
+async def test_lag_returns_zero_when_unknowable(redis: Redis, consumer: StreamConsumer):
+    """Regression: Redis sets both `lag` and `entries-read` to None together once an entry is
+    deleted from the stream before this group read it (e.g. by MAXLEN trimming) — the old
+    fallback (XLEN - entries-read) then crashed with TypeError, on the worker's own metrics
+    path, in exactly the situation it existed to handle."""
+    await consumer.ensure_group()
+    ids = [await _publish(redis, _event(f"t{i}")) for i in range(5)]
+    await redis.xdel(STREAM, ids[2])
+
+    assert await consumer.lag() == 0

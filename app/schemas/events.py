@@ -8,7 +8,7 @@ precision is lost in serialisation.
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class TransactionEventIn(BaseModel):
@@ -23,6 +23,15 @@ class TransactionEventIn(BaseModel):
     """ISO-4217, upper-cased on validation."""
 
     timestamp: datetime
+
+    @field_validator("currency")
+    @classmethod
+    def _upper_currency(cls, value: str) -> str:
+        """A lowercase "eur" must mean the same thing as "EUR": both reach the rate lookup
+        and the DB with the identical, canonical code. Without this, "eur" 404s at the rate
+        service and dead-letters as a bad currency — a data-shaped bug that's really an input
+        normalization gap."""
+        return value.upper()
 
 
 class TransactionEvent(TransactionEventIn):

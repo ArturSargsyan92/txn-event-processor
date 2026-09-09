@@ -5,7 +5,6 @@ crash mid-processing means redelivery rather than loss — and the idempotent in
 `TransactionRepository` is what makes that redelivery harmless.
 """
 
-import asyncio
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
@@ -22,6 +21,11 @@ class StreamMessage:
     event: TransactionEvent
     delivery_count: int
     """How many times this message has been delivered. Drives the dead-letter cutoff."""
+
+    raw_fields: dict[str, str]
+    """The exact original XADD fields. Dead-lettering replays these unchanged, rather than
+    re-serializing `event` — which would silently drop `schema_version` (StreamEnvelope's
+    default of 1 every time) if the entry actually arrived as some future v2."""
 
 
 class StreamConsumer:
@@ -82,13 +86,18 @@ class StreamConsumer:
             return []
 
         _stream_name, entries = response[0]
-        return await self._parse_entries(entries, delivery_count=1)
+        delivery_counts = {msg_id: 1 for msg_id, _fields in entries}
+        return await self._parse_entries(entries, delivery_counts)
 
     async def claim_stale(self, min_idle_ms: int) -> list[StreamMessage]:
         """XAUTOCLAIM messages pending longer than `min_idle_ms`.
 
         This is the recovery path for both a crashed consumer and a message this worker left
-        deliberately unacked after exhausting its retries.
+        deliberately unacked after exhausting its retries. Note it does not exclude the calling
+        consumer: a worker whose own in-flight message has been pending longer than
+        `min_idle_ms` can reclaim and reprocess it — safe here only because the insert is
+        idempotent. Needs Redis >= 7.0 for XAUTOCLAIM's three-element reply (older servers
+        return two); pin that when the compose file is written.
         """
         _next_cursor, claimed, _deleted = await self._redis.xautoclaim(
             self._stream,
@@ -102,15 +111,15 @@ class StreamConsumer:
             return []
 
         # XAUTOCLAIM increments each message's delivery count but doesn't return the new
-        # value — only XPENDING's extended form does. One lookup per message rather than a
-        # single range query: reclaim isn't the hot path (it runs on a timer, not per-event),
-        # and this avoids needing any stream-id range/ordering logic to get right.
-        counts = await asyncio.gather(
-            *(self._delivery_count(msg_id) for msg_id, _fields in claimed)
-        )
-        delivery_counts = dict(zip((msg_id for msg_id, _ in claimed), counts, strict=True))
+        # value — only XPENDING's extended form does. One lookup per message, sequentially,
+        # rather than a single range query: reclaim isn't the hot path (it runs on a timer,
+        # not per-event), and this avoids needing any stream-id range/ordering logic to get
+        # right (plain string comparison gets it wrong — "10-0" < "9-0" lexicographically).
+        delivery_counts = {}
+        for msg_id, _fields in claimed:
+            delivery_counts[msg_id] = await self._delivery_count(msg_id)
 
-        return await self._parse_entries(claimed, delivery_count=delivery_counts)
+        return await self._parse_entries(claimed, delivery_counts)
 
     async def _delivery_count(self, msg_id: str) -> int:
         """How many times `msg_id` has been delivered, via XPENDING's extended form."""
@@ -122,14 +131,9 @@ class StreamConsumer:
     async def _parse_entries(
         self,
         entries: list[tuple[str, dict[str, str]]],
-        *,
-        delivery_count: int | dict[str, int],
+        delivery_counts: dict[str, int],
     ) -> list[StreamMessage]:
-        """Turn raw (id, fields) pairs into StreamMessages, dead-lettering unparseable ones.
-
-        `delivery_count` is either a single value (every entry from `read()` is a first
-        delivery) or a per-id mapping (from `claim_stale()`, where counts vary).
-        """
+        """Turn raw (id, fields) pairs into StreamMessages, dead-lettering unparseable ones."""
         messages = []
         for msg_id, fields in entries:
             try:
@@ -138,8 +142,14 @@ class StreamConsumer:
                 await self._dead_letter_fields(msg_id, fields, reason=f"unparseable: {exc}")
                 continue
 
-            count = delivery_count if isinstance(delivery_count, int) else delivery_count[msg_id]
-            messages.append(StreamMessage(msg_id=msg_id, event=event, delivery_count=count))
+            messages.append(
+                StreamMessage(
+                    msg_id=msg_id,
+                    event=event,
+                    delivery_count=delivery_counts[msg_id],
+                    raw_fields=fields,
+                )
+            )
         return messages
 
     async def ack(self, msg_id: str) -> None:
@@ -151,9 +161,12 @@ class StreamConsumer:
 
         Acking after the DLQ write is the ordering that cannot lose an event: a crash in between
         leaves the message pending and it is simply reclaimed and dead-lettered again.
+
+        Replays `msg.raw_fields` verbatim rather than re-serializing `msg.event` — the latter
+        would silently reset schema_version to StreamEnvelope's default of 1 on every
+        dead-letter, regardless of what the entry actually arrived as.
         """
-        envelope = StreamEnvelope(payload=msg.event.model_dump_json())
-        await self._dead_letter_fields(msg.msg_id, envelope.to_fields(), reason)
+        await self._dead_letter_fields(msg.msg_id, msg.raw_fields, reason)
 
     async def _dead_letter_fields(self, msg_id: str, fields: dict[str, str], reason: str) -> None:
         """Shared core for `dead_letter` and the unparseable-payload path in `_parse_entries` —
@@ -165,12 +178,13 @@ class StreamConsumer:
     async def lag(self) -> int:
         """Entries not yet delivered to this group.
 
-        Reads the `lag` field from XINFO GROUPS; that field can be None after a trim, in which
-        case fall back to XLEN minus entries-read.
+        Reads the `lag` field from XINFO GROUPS. Redis sets that field to None exactly when it
+        can no longer compute it — entries were deleted from the stream (by MAXLEN trimming,
+        say) before this group read them — and `entries-read` goes None in that same situation,
+        so there's no reliable fallback arithmetic to reconstruct the true count from XLEN
+        either. Reports 0 rather than crashing or overcounting: an unknown lag is treated as
+        "nothing measurable," not "assume the worst."
         """
         groups = await self._redis.xinfo_groups(self._stream)
         group = next(g for g in groups if g["name"] == self._group)
-
-        if group["lag"] is not None:
-            return group["lag"]
-        return await self._redis.xlen(self._stream) - group["entries-read"]
+        return group["lag"] or 0
