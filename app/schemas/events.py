@@ -45,13 +45,25 @@ class StreamEnvelope(BaseModel):
 
     def to_fields(self) -> dict[str, str]:
         """Flatten for XADD."""
-        ...
+        return {"schema_version": str(self.schema_version), "payload": self.payload}
 
     @classmethod
     def from_fields(cls, fields: dict[str, str]) -> "StreamEnvelope":
-        """Rebuild from an XREADGROUP / XAUTOCLAIM entry."""
-        ...
+        """Rebuild from an XREADGROUP / XAUTOCLAIM entry.
+
+        Raises:
+            KeyError: a required field is missing.
+            ValueError: `schema_version` isn't an integer, or `payload` isn't valid JSON for
+                this model — both mean the entry is corrupt, not merely unfamiliar.
+        """
+        return cls(schema_version=int(fields["schema_version"]), payload=fields["payload"])
 
     def to_event(self) -> TransactionEvent:
-        """Parse the payload back into a validated event."""
-        ...
+        """Parse the payload back into a validated event.
+
+        Raises:
+            ValueError: the payload doesn't validate as a TransactionEvent (pydantic's
+                ValidationError is a ValueError subclass) — same "corrupt, not unfamiliar"
+                reasoning as `from_fields`.
+        """
+        return TransactionEvent.model_validate_json(self.payload)

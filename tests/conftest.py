@@ -10,6 +10,8 @@ import random
 from collections.abc import AsyncIterator
 
 import pytest
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
@@ -17,6 +19,7 @@ from sqlmodel import SQLModel
 from app.core.config import Settings
 from app.db.engine import create_engine, create_session_factory, init_models
 from app.db.errors import DB_EXCEPTIONS
+from app.queue.client import create_redis
 
 
 @pytest.fixture
@@ -26,18 +29,21 @@ def settings() -> Settings:
     Bypasses `get_settings()`'s cache entirely — constructed directly so each test gets an
     isolated instance regardless of import order.
 
-    `database_url` falls back to a plain localhost URL rather than Settings' own default
-    (docker-compose's `postgres` service + the app's real database) — this fixture drops
-    every table it touches, so that default must never be reachable by accident. Read
-    directly from os.environ rather than left to Settings' own env parsing: passing
-    database_url as a constructor kwarg at all, even conditionally, takes precedence over
-    APP_DATABASE_URL in pydantic-settings' source order, so building the kwarg from the
-    environment ourselves is what keeps the override actually overridable.
+    `database_url`/`redis_url` fall back to plain localhost URLs rather than Settings' own
+    defaults (docker-compose's `postgres`/`redis` services) — these fixtures drop every table
+    and flush the whole database they touch, so those defaults must never be reachable by
+    accident. Read directly from os.environ rather than left to Settings' own env parsing:
+    passing either as a constructor kwarg at all, even conditionally, takes precedence over
+    the matching APP_* env var in pydantic-settings' source order, so building the kwarg from
+    the environment ourselves is what keeps the override actually overridable. `redis_url`
+    defaults to db index 1, not 0, as one more margin against colliding with a Redis a
+    developer happens to already be running locally for something else.
     """
     return Settings(
         database_url=os.environ.get(
             "APP_DATABASE_URL", "postgresql+asyncpg://postgres@localhost:5432/txn_events_test"
         ),
+        redis_url=os.environ.get("APP_REDIS_URL", "redis://localhost:6379/1"),
         retry_base_delay_s=0.01,
         retry_max_delay_s=0.08,
         rate_attempts=3,
@@ -115,6 +121,29 @@ async def session_factory(
     """
     await init_models(postgres_engine)
     return create_session_factory(postgres_engine)
+
+
+@pytest.fixture
+async def redis(settings: Settings) -> AsyncIterator[Redis]:
+    """A real, connected Redis client — flushed (FLUSHDB) after each test.
+
+    Needs a reachable Redis: point APP_REDIS_URL at a *dedicated test db index* — this
+    fixture wipes the whole database it's pointed at. Skips with a clear reason if nothing is
+    reachable, so `uv run pytest` still runs everywhere; only the tests that need a real queue
+    are skipped.
+    """
+    client = create_redis(settings.redis_url)
+    try:
+        await client.ping()
+    except (OSError, RedisError) as exc:
+        await client.aclose()
+        pytest.skip(f"no Redis reachable at {settings.redis_url!r}: {exc}")
+
+    try:
+        yield client
+    finally:
+        await client.flushdb()
+        await client.aclose()
 
 
 @pytest.fixture

@@ -6,7 +6,7 @@ full speed and the queue depth — not Postgres — absorbs the spike.
 
 from redis.asyncio import Redis
 
-from app.schemas.events import TransactionEvent
+from app.schemas.events import StreamEnvelope, TransactionEvent
 
 
 class EventProducer:
@@ -27,4 +27,10 @@ class EventProducer:
         Returns:
             The stream message id, echoed back to the client for correlation.
         """
-        ...
+        envelope = StreamEnvelope(payload=event.model_dump_json())
+        return await self._redis.xadd(
+            self._stream,
+            envelope.to_fields(),
+            maxlen=self._maxlen,
+            approximate=True,
+        )
