@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
+    "greenlet>=3.0", # SQLAlchemy's async engine needs it internally; asyncpg alone doesn't pull it in
     "httpx>=0.28.1",
     "prometheus-client>=0.26.0",
     "pydantic-settings>=2.15.0",

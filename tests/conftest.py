@@ -6,10 +6,15 @@ it needs rather than everything being built up front against interfaces that may
 
 import asyncio
 import random
+from collections.abc import AsyncIterator
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlmodel import SQLModel
 
 from app.core.config import Settings
+from app.core.errors import DatabaseUnavailable
+from app.db.engine import create_engine, create_session_factory, init_models, wait_until_ready
 
 
 @pytest.fixture
@@ -57,9 +62,31 @@ def seeded_random(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-async def session_factory():
-    """Async session factory against the test database, with tables created and dropped."""
-    ...
+async def session_factory(
+    settings: Settings,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Async session factory against the test database, with tables created and dropped.
+
+    Needs a reachable Postgres: point APP_DATABASE_URL at one (docker-compose's `postgres`
+    service, or a local instance) before running the DB-backed tests. Skips with a clear reason
+    if none is reachable, so `uv run pytest` still runs everywhere — only the tests that need a
+    real database are skipped.
+    """
+    engine = create_engine(settings.database_url)
+    try:
+        await wait_until_ready(engine, attempts=1, base_delay=0)
+    except DatabaseUnavailable as exc:
+        await engine.dispose()
+        pytest.skip(f"no Postgres reachable at {settings.database_url!r}: {exc}")
+
+    await init_models(engine)
+    factory = create_session_factory(engine)
+    try:
+        yield factory
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+        await engine.dispose()
 
 
 @pytest.fixture
