@@ -19,4 +19,4 @@ def convert_to_usd(amount: Decimal, rate: Decimal) -> Decimal:
     Quantized to cents with `ROUNDING`. Multiplication happens at full Decimal precision and is
     rounded exactly once, at the end, so no intermediate rounding error accumulates.
     """
-    ...
+    return (amount * rate).quantize(USD_QUANT, rounding=ROUNDING)
