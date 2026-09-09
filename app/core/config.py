@@ -3,8 +3,16 @@
 One Settings object is shared by the API and the worker; docker-compose supplies the
 differences. Every tunable that affects retry or delivery semantics lives here so the
 behaviour can be reasoned about (and demoed) without touching code.
+
+Defaults point at the docker-compose service names and are tuned for a live demo (short
+TTLs, low retry/attempt counts) rather than production; override via APP_-prefixed
+environment variables or a .env file for anything else.
 """
 
+import socket
+from functools import lru_cache
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,44 +22,56 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
 
     # --- Infrastructure -------------------------------------------------------------
-    database_url: str
-    redis_url: str
-    rate_service_url: str
+    database_url: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/txn_events"
+    redis_url: str = "redis://redis:6379/0"
+    rate_service_url: str = "http://rate-service:8000"
 
     # --- Stream / consumer group ----------------------------------------------------
-    stream_name: str
-    dlq_stream_name: str
-    consumer_group: str
-    consumer_name: str
-    batch_size: int
-    block_ms: int
-    stream_maxlen: int | None
+    stream_name: str = "transactions"
+    dlq_stream_name: str = "transactions:dlq"
+    consumer_group: str = "transaction-processors"
+    consumer_name: str = Field(default_factory=socket.gethostname)
+    """Defaults to the container hostname, so `--scale worker=N` gives each replica a
+    distinct consumer name for free — Docker assigns each container its own hostname."""
+
+    batch_size: int = 10
+    block_ms: int = 5000
+    stream_maxlen: int | None = 100_000
 
     # --- Delivery semantics ---------------------------------------------------------
-    max_deliveries: int
+    max_deliveries: int = 5
     """Deliveries after which a still-failing message is dead-lettered instead of retried."""
 
-    reclaim_interval_s: float
+    reclaim_interval_s: float = 5.0
     """How often the worker sweeps for messages abandoned by a dead or stuck consumer."""
 
-    min_idle_ms: int
-    """How long a message must sit pending before XAUTOCLAIM will reclaim it."""
+    min_idle_ms: int = 15_000
+    """How long a message must sit pending before XAUTOCLAIM will reclaim it.
+
+    Kept low (~15s) so the demo doesn't have long dead air between a fault and the
+    visible reclaim.
+    """
 
     # --- Retry knobs ----------------------------------------------------------------
-    rate_attempts: int
-    db_attempts: int
-    retry_base_delay_s: float
-    retry_max_delay_s: float
+    rate_attempts: int = 4
+    db_attempts: int = 4
+    retry_base_delay_s: float = 0.2
+    retry_max_delay_s: float = 5.0
 
     # --- Rate lookup ----------------------------------------------------------------
-    rate_cache_ttl_s: float
+    rate_cache_ttl_s: float = 5.0
     """In-process cache TTL. Short enough that stopping the rate-service shows up quickly."""
 
     # --- Observability --------------------------------------------------------------
-    worker_metrics_port: int
-    log_level: str
+    worker_metrics_port: int = 9100
+    log_level: str = "INFO"
 
 
+@lru_cache
 def get_settings() -> Settings:
-    """Build (and cache) the Settings singleton."""
-    ...
+    """Build (and cache) the Settings singleton.
+
+    Cached with lru_cache rather than a module-level global so tests can bypass the
+    cache entirely by constructing Settings(...) directly instead of touching it.
+    """
+    return Settings()
