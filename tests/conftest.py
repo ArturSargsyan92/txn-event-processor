@@ -9,6 +9,7 @@ import os
 import random
 from collections.abc import AsyncIterator
 
+import httpx
 import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -19,7 +20,9 @@ from sqlmodel import SQLModel
 from app.core.config import Settings
 from app.db.engine import create_engine, create_session_factory, init_models
 from app.db.errors import DB_EXCEPTIONS
+from app.db.repository import TransactionRepository
 from app.queue.client import create_redis
+from app.queue.producer import EventProducer
 
 
 @pytest.fixture
@@ -152,6 +155,37 @@ async def redis(settings: Settings) -> AsyncIterator[Redis]:
 
 
 @pytest.fixture
-async def api_client():
-    """httpx.AsyncClient bound to the app via ASGITransport, dependencies overridden."""
-    ...
+async def api_client(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Redis,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """httpx.AsyncClient bound to the app via ASGITransport, dependencies overridden.
+
+    ASGITransport never sends the ASGI lifespan protocol for plain HTTP calls (confirmed by
+    reading httpx's own source: it only ever forwards `http` scope events) — so the app's own
+    `lifespan`, which would build a repository/producer from Settings()'s docker-compose-
+    default URLs, never runs at all. `dependency_overrides` is what actually wires the routes
+    to this test's session_factory/redis fixtures instead — real infra, but this test's own
+    database and queue, never whatever the app would have built from its own defaults.
+
+    Imports `app.main` locally rather than at module level so importing conftest.py doesn't
+    unconditionally trigger `configure_logging` (a side effect of `app.main`'s own
+    `app = create_app()`) for every test session, only ones that actually use this fixture.
+    """
+    from app.api.deps import get_producer, get_redis, get_repository, get_settings
+    from app.main import app
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_redis] = lambda: redis
+    app.dependency_overrides[get_repository] = lambda: TransactionRepository(session_factory)
+    app.dependency_overrides[get_producer] = lambda: EventProducer(
+        redis, settings.stream_name, settings.stream_maxlen
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()

@@ -17,22 +17,22 @@ from app.queue.producer import EventProducer
 
 def get_settings(request: Request) -> Settings:
     """The Settings built at startup."""
-    ...
+    return request.app.state.settings
 
 
 def get_redis(request: Request) -> Redis:
     """The shared Redis client."""
-    ...
+    return request.app.state.redis
 
 
 def get_producer(request: Request) -> EventProducer:
     """The producer bound to the configured stream."""
-    ...
+    return request.app.state.producer
 
 
 def get_repository(request: Request) -> TransactionRepository:
     """Repository over the shared session factory."""
-    ...
+    return request.app.state.repository
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
