@@ -43,7 +43,7 @@ async def handle(
 ) -> None:
     """Process one delivery and decide its fate. This function *is* the delivery policy.
 
-    Three failure branches, each tested in tests/test_worker_handle.py:
+    Four branches, each tested in tests/test_worker_handle.py:
 
     * PermanentError -> dead-letter with the original reason. Bad data must never come back.
     * TransientError, under max_deliveries -> do nothing at all. No ack, no DLQ: the message
@@ -51,6 +51,14 @@ async def handle(
       Doing nothing is the deliberate behaviour, which is exactly why it is asserted.
     * TransientError, at or over max_deliveries -> dead-letter. This is the cutoff that stops a
       poison message being reclaimed forever and growing the pending list without bound.
+    * Anything else — neither AppError subclass — dead-letters too, immediately. `classify_db_error`
+      and RateClient both deliberately let some failures (a numeric overflow, an unexpected 4xx)
+      propagate unclassified rather than mislabel them; without this branch, one of those crashes
+      `consume_loop`, and since the message is never acked, it comes right back on restart via
+      `claim_stale` and crashes the worker again — an unbounded crash loop, never reaching the DLQ,
+      the exact failure the DLQ exists to prevent. `except Exception`, not `except BaseException`:
+      CancelledError is a BaseException specifically so a handler like this one can't catch it,
+      which is what keeps a SIGTERM-triggered shutdown mid-`handle` propagating correctly.
 
     Success acks. Note that a DUPLICATE outcome is a success, not a failure — it is the expected
     shape of at-least-once delivery meeting an idempotent write.
@@ -80,6 +88,13 @@ async def handle(
                 extra={**log_fields, "delivery_count": msg.delivery_count, "error": str(exc)},
             )
             # deliberately no ack, no dead_letter — see the docstring above
+    except Exception as exc:
+        await consumer.dead_letter(msg, reason=f"unexpected error: {exc}")
+        EVENTS_FAILED.labels(kind="unexpected").inc()
+        logger.error(
+            "dead-lettered: unexpected error",
+            extra={**log_fields, "reason": str(exc), "error_type": type(exc).__name__},
+        )
 
 
 async def consume_loop(
@@ -168,19 +183,23 @@ async def run_worker(settings: Settings) -> None:
             tg.create_task(reclaim_loop(consumer, processor, settings))
             tg.create_task(lag_loop(consumer))
             tg.create_task(_watch_for_shutdown(stop_event))
-    except* BaseException as eg:
-        # _ShutdownRequested cancels every sibling task, and a task cancelled mid-blocking-
-        # read (e.g. consume_loop inside XREADGROUP) can surface as redis.exceptions.
-        # TimeoutError rather than plain CancelledError — redis-py's internal asyncio.timeout()
-        # can't always tell "my own deadline expired" from "an outer cancellation landed here
-        # at the same moment", and converts the latter into the former too. _ShutdownRequested
-        # only ever gets raised by _watch_for_shutdown in response to a real signal, so its
-        # presence in this group unambiguously means every other exception alongside it is
-        # cancellation noise from the same deliberate shutdown, not an independent failure —
-        # treat the whole batch as a clean stop. Absent it, re-raise everything: a real crash
-        # in any loop must still surface as a real crash.
-        if eg.subgroup(_ShutdownRequested) is None:
-            raise
+    except* _ShutdownRequested:
+        # Only this sentinel is matched here — except* partitions the group, so a genuine
+        # crash in any sibling task (consume_loop, reclaim_loop, lag_loop) that happens to
+        # land in the same group is *not* caught by this clause and is automatically
+        # re-raised once the block exits. That's what keeps a real bug racing with a SIGTERM
+        # from silently disappearing: verified directly by raising both a RuntimeError and
+        # _ShutdownRequested in one TaskGroup and confirming the RuntimeError still escapes.
+        #
+        # A task cancelled mid-blocking-read can in principle surface as some client
+        # library's own timeout exception rather than plain CancelledError, which would
+        # slip past this clause too. create_redis's socket_timeout margin (see run_worker
+        # above) is what actually prevents that for the one place it was observed to happen
+        # (consumer.read()'s XREADGROUP) — measured at 0% occurrence with that margin in
+        # place under realistic cancellation timing, versus close to it exactly at the
+        # client's own (now much later) deadline. Not defended against with more code here:
+        # that residual is real but exceedingly narrow, and the cost of catching it — the
+        # broader except* this replaced — silently swallowed genuine crashes instead.
         logger.info("shutting down")
     finally:
         await http.aclose()

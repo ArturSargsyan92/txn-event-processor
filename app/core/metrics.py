@@ -20,7 +20,7 @@ EVENTS_PROCESSED = Counter(
 EVENTS_FAILED = Counter(
     "events_failed_total",
     "Event deliveries that ended in failure, by kind.",
-    labelnames=("kind",),  # transient | permanent | exhausted
+    labelnames=("kind",),  # transient | permanent | exhausted | unexpected
 )
 
 RETRIES = Counter(
@@ -38,3 +38,7 @@ PROCESSING_SECONDS = Histogram(
     "event_processing_seconds",
     "Wall time for one full process() call, including retries.",
 )
+"""Recorded on both the success and the exception path (see the `with` block in
+processor.process): "how long did this event take before we knew its outcome" is deliberately
+the question this answers, not "how long did successful processing take" — a rate-service
+outage inflating the p99 here IS the retry cost becoming visible, which is the point."""

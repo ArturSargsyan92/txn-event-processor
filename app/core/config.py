@@ -36,7 +36,11 @@ class Settings(BaseSettings):
     distinct consumer name for free — Docker assigns each container its own hostname."""
 
     batch_size: int = 10
-    block_ms: int = 5000
+    block_ms: int = Field(default=5000, ge=1)
+    """0 means "block indefinitely" in Redis's own XREADGROUP semantics — excluded here because
+    the worker derives the Redis client's socket_timeout from this value (block_ms/1000 + a
+    margin); a genuinely unbounded block would make that derived timeout meaningless too."""
+
     stream_maxlen: int | None = 100_000
 
     @property

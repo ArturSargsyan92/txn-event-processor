@@ -15,9 +15,9 @@ import pytest
 
 from app.core.config import Settings
 from app.core.errors import PermanentError, TransientError
-from app.queue.consumer import StreamMessage
+from app.queue.consumer import StreamConsumer, StreamMessage
 from app.schemas.events import TransactionEvent
-from app.services.processor import Outcome
+from app.services.processor import EventProcessor, Outcome
 from app.worker import handle
 
 
@@ -40,12 +40,15 @@ def _msg(delivery_count: int = 1) -> StreamMessage:
 
 @pytest.fixture
 def processor() -> AsyncMock:
-    return AsyncMock()
+    # spec=EventProcessor: a call to a method that doesn't exist on the real class raises
+    # here too, instead of the mock silently accepting it — "no call happened" assertions
+    # elsewhere in this file are only meaningful against the real interface.
+    return AsyncMock(spec=EventProcessor)
 
 
 @pytest.fixture
 def consumer() -> AsyncMock:
-    return AsyncMock()
+    return AsyncMock(spec=StreamConsumer)
 
 
 async def test_success_acks(processor: AsyncMock, consumer: AsyncMock, settings: Settings):
@@ -54,6 +57,7 @@ async def test_success_acks(processor: AsyncMock, consumer: AsyncMock, settings:
 
     await handle(msg, processor, consumer, settings)
 
+    processor.process.assert_awaited_once_with(msg.event)
     consumer.ack.assert_awaited_once_with(msg.msg_id)
     consumer.dead_letter.assert_not_awaited()
 
@@ -134,4 +138,28 @@ async def test_transient_error_over_limit_dead_letters(
     await handle(msg, processor, consumer, settings)
 
     consumer.dead_letter.assert_awaited_once_with(msg, reason="max deliveries exceeded")
+    consumer.ack.assert_not_awaited()
+
+
+async def test_unexpected_error_dead_letters_immediately(
+    processor: AsyncMock, consumer: AsyncMock, settings: Settings
+):
+    """Neither TransientError nor PermanentError -> dead-letters right away, regardless of
+    delivery_count.
+
+    Regression: this used to be unhandled, so an exception outside the app's own taxonomy —
+    classify_db_error and RateClient both deliberately let some failures through unclassified
+    rather than mislabel them — crashed consume_loop. Since the message was never acked, it
+    came right back via claim_stale on restart and crashed the worker again: a crash loop that
+    never reached the DLQ, the exact failure the DLQ exists to prevent.
+    """
+    processor.process.side_effect = ValueError("a malformed rate-service response body")
+    msg = _msg(delivery_count=1)
+
+    await handle(msg, processor, consumer, settings)
+
+    consumer.dead_letter.assert_awaited_once()
+    call = consumer.dead_letter.await_args
+    assert call.args[0] is msg
+    assert "a malformed rate-service response body" in call.kwargs["reason"]
     consumer.ack.assert_not_awaited()
