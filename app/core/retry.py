@@ -41,12 +41,15 @@ async def retry_async[T](
     retry_on: tuple[type[Exception], ...] = (TransientError,),
     on_retry: OnRetry | None = None,
 ) -> T:
-    """Await `fn()`, retrying up to `attempts` times on `retry_on`.
+    """Await `fn()`, making at most `attempts` calls total (so `attempts - 1` retries).
 
     Anything outside `retry_on` (notably PermanentError) propagates immediately — retrying it
     would just burn the delivery budget. Once attempts run out the last error is re-raised, so
     the caller still sees a TransientError and can decide between "leave pending" and "DLQ".
     """
+    if attempts < 1:
+        raise ValueError("retry_async requires attempts >= 1")
+
     for attempt in range(1, attempts + 1):
         try:
             return await fn()
@@ -57,5 +60,3 @@ async def retry_async[T](
             if on_retry is not None:
                 on_retry(attempt, exc, delay)
             await asyncio.sleep(delay)
-    # Unreachable: attempts >= 1 means the loop above always either returns or raises.
-    raise AssertionError("retry_async requires attempts >= 1")

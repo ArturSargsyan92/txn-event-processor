@@ -19,7 +19,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Environment-driven settings. See `.env` / docker-compose for the deployed values."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="ignore")
+    # extra="forbid": a typo'd env var (APP_DATABSE_URL) fails at startup instead of being
+    # silently dropped and surfacing later as an unexplained connection error.
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_", extra="forbid")
 
     # --- Infrastructure -------------------------------------------------------------
     database_url: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/txn_events"
@@ -28,7 +30,6 @@ class Settings(BaseSettings):
 
     # --- Stream / consumer group ----------------------------------------------------
     stream_name: str = "transactions"
-    dlq_stream_name: str = "transactions:dlq"
     consumer_group: str = "transaction-processors"
     consumer_name: str = Field(default_factory=socket.gethostname)
     """Defaults to the container hostname, so `--scale worker=N` gives each replica a
@@ -38,8 +39,14 @@ class Settings(BaseSettings):
     block_ms: int = 5000
     stream_maxlen: int | None = 100_000
 
+    @property
+    def dlq_stream_name(self) -> str:
+        """Always `{stream_name}:dlq` — not an independent setting, so overriding
+        stream_name alone can never leave the DLQ pointing at the wrong stream."""
+        return f"{self.stream_name}:dlq"
+
     # --- Delivery semantics ---------------------------------------------------------
-    max_deliveries: int = 5
+    max_deliveries: int = Field(default=5, ge=1)
     """Deliveries after which a still-failing message is dead-lettered instead of retried."""
 
     reclaim_interval_s: float = 5.0
@@ -53,8 +60,8 @@ class Settings(BaseSettings):
     """
 
     # --- Retry knobs ----------------------------------------------------------------
-    rate_attempts: int = 4
-    db_attempts: int = 4
+    rate_attempts: int = Field(default=4, ge=1)
+    db_attempts: int = Field(default=4, ge=1)
     retry_base_delay_s: float = 0.2
     retry_max_delay_s: float = 5.0
 
