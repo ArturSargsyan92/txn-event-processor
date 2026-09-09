@@ -9,12 +9,13 @@ import random
 from collections.abc import AsyncIterator
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
 from app.core.config import Settings
-from app.core.errors import DatabaseUnavailable
-from app.db.engine import create_engine, create_session_factory, init_models, wait_until_ready
+from app.db.engine import create_engine, create_session_factory, init_models
 
 
 @pytest.fixture
@@ -62,31 +63,46 @@ def seeded_random(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-async def session_factory(
-    settings: Settings,
-) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Async session factory against the test database, with tables created and dropped.
+async def postgres_engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
+    """A real, connected engine against a dedicated test database — no tables created.
 
-    Needs a reachable Postgres: point APP_DATABASE_URL at one (docker-compose's `postgres`
-    service, or a local instance) before running the DB-backed tests. Skips with a clear reason
-    if none is reachable, so `uv run pytest` still runs everywhere — only the tests that need a
-    real database are skipped.
+    Needs a reachable Postgres: point APP_DATABASE_URL at a *dedicated test database* — this
+    fixture drops every table after each test, so pointing it at docker-compose's real
+    `postgres` service would wipe the app's own data. Skips with a clear reason if nothing is
+    reachable, so `uv run pytest` still runs everywhere; only the tests that need a real
+    database are skipped.
+
+    Kept separate from `session_factory` (below) so a test can exercise `wait_until_ready`
+    against a database that genuinely has no tables yet — the exact case its retry loop exists
+    to wait out.
     """
     engine = create_engine(settings.database_url)
     try:
-        await wait_until_ready(engine, attempts=1, base_delay=0)
-    except DatabaseUnavailable as exc:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except (OSError, SQLAlchemyError) as exc:
         await engine.dispose()
         pytest.skip(f"no Postgres reachable at {settings.database_url!r}: {exc}")
 
-    await init_models(engine)
-    factory = create_session_factory(engine)
     try:
-        yield factory
+        yield engine
     finally:
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.drop_all)
         await engine.dispose()
+
+
+@pytest.fixture
+async def session_factory(
+    postgres_engine: AsyncEngine,
+) -> async_sessionmaker[AsyncSession]:
+    """Async session factory against the test database, with tables created before the test.
+
+    Teardown (drop_all + dispose) happens once, in `postgres_engine` — this fixture only adds
+    the schema on top of an already-verified-reachable engine.
+    """
+    await init_models(postgres_engine)
+    return create_session_factory(postgres_engine)
 
 
 @pytest.fixture

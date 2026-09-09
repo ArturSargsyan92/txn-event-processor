@@ -40,21 +40,30 @@ async def init_models(engine: AsyncEngine) -> None:
 
 
 async def wait_until_ready(engine: AsyncEngine, *, attempts: int, base_delay: float) -> None:
-    """Block until a trivial SELECT succeeds, so the worker can start before Postgres is up.
+    """Block until `processed_transactions` is queryable, so the worker doesn't start
+    processing before the API's `init_models` has run.
+
+    Probes the real table, not a bare `SELECT 1` — Postgres accepting connections doesn't mean
+    the API has created the schema yet, and this function's whole job is to wait for that too.
+
+    Deliberately broad about what counts as "not ready" (any OSError or SQLAlchemyError),
+    unlike TransactionRepository's methods: telling a live operational failure apart from bad
+    data is that class's job; this function's only job is "keep trying until the environment
+    is up," so a missing table belongs in the same bucket as a refused connection.
 
     Runs once, at process startup — the cap is a fixed 5s rather than a Settings knob, since
     there's nothing here to tune for the fault-injection demo.
     """
 
-    async def ping() -> None:
+    async def probe() -> None:
         try:
             async with engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
+                await conn.execute(text("SELECT 1 FROM processed_transactions LIMIT 1"))
         except (OSError, SQLAlchemyError) as exc:
             raise DatabaseUnavailable(str(exc)) from exc
 
     await retry_async(
-        ping,
+        probe,
         attempts=attempts,
         base_delay=base_delay,
         max_delay=5.0,

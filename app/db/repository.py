@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.errors import DatabaseUnavailable
@@ -19,7 +19,14 @@ from app.db.models import ProcessedTransaction
 
 
 class TransactionRepository:
-    """Reads and writes for `processed_transactions`."""
+    """Reads and writes for `processed_transactions`.
+
+    Every method wraps only OperationalError/InterfaceError (SQLAlchemy's names for a dropped
+    or refused connection) and raw OSError as DatabaseUnavailable — deliberately not the
+    broader SQLAlchemyError. A DataError (a value too long for a column) or an IntegrityError
+    (a NOT NULL violation) means the data or the schema is wrong, not the connection; retrying
+    can never fix that, so it propagates unclassified rather than being mislabeled transient.
+    """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -49,11 +56,12 @@ class TransactionRepository:
         try:
             async with self._session_factory() as session:
                 result = await session.execute(stmt)
+                inserted = result.first() is not None
                 await session.commit()
-        except (OSError, SQLAlchemyError) as exc:
+        except (OSError, OperationalError, InterfaceError) as exc:
             raise DatabaseUnavailable(str(exc)) from exc
 
-        return result.first() is not None
+        return inserted
 
     async def user_summary(self, user_id: str) -> tuple[Decimal, int]:
         """Total USD and transaction count for a user.
@@ -70,7 +78,7 @@ class TransactionRepository:
         try:
             async with self._session_factory() as session:
                 total, count = (await session.execute(stmt)).one()
-        except (OSError, SQLAlchemyError) as exc:
+        except (OSError, OperationalError, InterfaceError) as exc:
             raise DatabaseUnavailable(str(exc)) from exc
 
         return Decimal(total), count
@@ -101,7 +109,10 @@ class TransactionRepository:
         rows_stmt = (
             select(ProcessedTransaction)
             .where(*conditions)
-            .order_by(ProcessedTransaction.timestamp.desc())
+            # id as a tiebreaker: timestamp alone isn't unique (a same-second ingest batch is
+            # realistic), and without one, ties have no defined order — limit/offset paging
+            # could then skip or repeat a row across two pages of the same query.
+            .order_by(ProcessedTransaction.timestamp.desc(), ProcessedTransaction.id.desc())
             .limit(limit)
             .offset(offset)
         )
@@ -111,7 +122,7 @@ class TransactionRepository:
             async with self._session_factory() as session:
                 rows = (await session.execute(rows_stmt)).scalars().all()
                 total = (await session.execute(count_stmt)).scalar_one()
-        except (OSError, SQLAlchemyError) as exc:
+        except (OSError, OperationalError, InterfaceError) as exc:
             raise DatabaseUnavailable(str(exc)) from exc
 
         return rows, total
