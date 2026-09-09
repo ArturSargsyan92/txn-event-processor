@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     retry_base_delay_s: float = 0.2
     retry_max_delay_s: float = 5.0
 
+    db_startup_attempts: int = Field(default=20, ge=1)
+    db_startup_base_delay_s: float = 1.0
+    """A separate, far more generous budget than db_attempts/retry_base_delay_s — those are
+    tuned for one event's per-attempt retry inside a delivery; this is for wait_until_ready at
+    process startup, waiting on an entirely different container to finish booting and run
+    create_all. Worst case with these defaults is a couple of minutes, not ~1.4s."""
+
     # --- Rate lookup ----------------------------------------------------------------
     rate_cache_ttl_s: float = 5.0
     """In-process cache TTL. Short enough that stopping the rate-service shows up quickly."""
