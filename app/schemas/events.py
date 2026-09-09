@@ -5,7 +5,7 @@ Field names match the assignment's contract exactly: {id, user_id, amount, curre
 precision is lost in serialisation.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, field_validator
@@ -32,6 +32,17 @@ class TransactionEventIn(BaseModel):
         service and dead-letters as a bad currency — a data-shaped bug that's really an input
         normalization gap."""
         return value.upper()
+
+    @field_validator("timestamp")
+    @classmethod
+    def _naive_timestamp_means_utc(cls, value: datetime) -> datetime:
+        """A timestamp with no UTC offset must not be interpreted in whatever timezone the
+        *process* happens to be running in — confirmed live: asyncpg encodes a naive
+        `datetime` via `astimezone()`, which assumes local time, so a naive `13:00` accepted
+        here lands in Postgres shifted by the worker container's own clock. Coercing to UTC
+        at the boundary, same rule as `GET /users/{id}/transactions`'s `from`/`to`, means
+        there's exactly one place "naive means UTC" is decided, not two."""
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class TransactionEvent(TransactionEventIn):

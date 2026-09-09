@@ -12,12 +12,14 @@ from redis.exceptions import RedisError
 
 from app.api.deps import ProducerDep, RedisDep, RepositoryDep
 from app.core.errors import DatabaseUnavailable
+from app.core.logging import get_logger
 from app.core.metrics import EVENTS_PUBLISHED
 from app.db.errors import DB_EXCEPTIONS
 from app.schemas.events import TransactionEvent, TransactionEventIn
 from app.schemas.responses import AcceptedResponse, TransactionOut, TransactionPage, UserSummary
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 @router.post("/events", status_code=202, response_model=AcceptedResponse)
@@ -34,7 +36,10 @@ async def ingest_event(payload: TransactionEventIn, producer: ProducerDep) -> Ac
         # This is the one path the whole architecture is built around ("queue depth, not
         # Postgres, absorbs the burst") — a Redis blip here must read as "try again" (503),
         # the same signal /health/ready already gives for the identical failure, not an
-        # opaque 500 with no retry hint for the client.
+        # opaque 500 with no retry hint for the client. Logged server-side too: the 503 alone
+        # is visible to the client, but an operator watching a "stop redis" demo has nothing
+        # else to look at — EVENTS_PUBLISHED only counts successes.
+        logger.warning("event publish failed: %s", exc, extra={"event_id": event.id})
         raise HTTPException(status_code=503, detail=f"queue unavailable: {exc}") from exc
 
     EVENTS_PUBLISHED.inc()

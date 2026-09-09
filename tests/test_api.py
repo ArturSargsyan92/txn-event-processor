@@ -32,16 +32,22 @@ async def _client_with_overrides(overrides: dict) -> AsyncIterator[httpx.AsyncCl
     The health/error-path tests below need Redis or Postgres to actually fail, which the
     `api_client` fixture's real connections can't do on demand — this builds a one-off client
     against `app.main.app` with only the given dependencies overridden.
+
+    Restores the *prior* overrides on exit rather than clearing unconditionally: `app.main.app`
+    is a module-global, so an unconditional `.clear()` would silently drop anything an outer
+    `api_client` had already wired up if this were ever nested inside it — restoring is what
+    makes this helper safe to use in isolation regardless of what else is touching the app.
     """
     from app.main import app
 
+    previous = app.dependency_overrides.copy()
     app.dependency_overrides.update(overrides)
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             yield client
     finally:
-        app.dependency_overrides.clear()
+        app.dependency_overrides = previous
 
 
 def _payload(id: str = "t1", **overrides: object) -> dict:
@@ -275,8 +281,62 @@ async def test_summary_is_503_when_database_is_unavailable():
 
 async def test_metrics_endpoint_is_mounted_and_reachable(api_client: httpx.AsyncClient):
     # Starlette's Mount 307-redirects a bare "/metrics" to "/metrics/" — hit the slash form
-    # directly to test the mount itself rather than the redirect (see CLAUDE.md/finding 3).
+    # directly to test the mount itself rather than the redirect.
     response = await api_client.get("/metrics/")
 
     assert response.status_code == 200
-    assert "events_published" in response.text
+    assert "events_published_total" in response.text
+
+
+def _events_published_total(metrics_text: str) -> float:
+    for line in metrics_text.splitlines():
+        if line.startswith("events_published_total "):
+            return float(line.split()[1])
+    raise AssertionError("events_published_total not found in /metrics output")
+
+
+async def test_post_event_increments_events_published(api_client: httpx.AsyncClient):
+    """The mount test above only proves the metric exists — this pins EVENTS_PUBLISHED
+    actually incrementing on a successful publish, which is the part that was silently
+    missing until the step-8 review-fix commit added `EVENTS_PUBLISHED.inc()`."""
+    before = _events_published_total((await api_client.get("/metrics/")).text)
+
+    await api_client.post("/events", json=_payload("metrics-check"))
+
+    after = _events_published_total((await api_client.get("/metrics/")).text)
+    assert after == before + 1
+
+
+async def test_post_event_is_503_when_queue_is_unreachable():
+    """No real Redis needed: the producer dependency is faked directly, so this runs even
+    in the no-infra pytest mode — the queue-down 503 is the single most important new
+    behavior in the step-8 review-fix commit and had no dedicated test until now."""
+    dead_producer = AsyncMock()
+    dead_producer.publish.side_effect = RedisError("connection refused")
+
+    from app.api.deps import get_producer
+
+    async with _client_with_overrides({get_producer: lambda: dead_producer}) as client:
+        response = await client.post("/events", json=_payload("t-queue-down"))
+
+    assert response.status_code == 503
+    assert "queue unavailable" in response.json()["detail"]
+
+
+async def test_transactions_naive_query_bounds_are_treated_as_utc():
+    """Deterministic version of the from/to UTC-coercion fix: the repo is faked so the
+    assertion doesn't depend on the test process's own timezone to reproduce the bug this
+    guards against (a naive bound silently interpreted in the DB session's timezone)."""
+    fake_repo = AsyncMock()
+    fake_repo.list_user_transactions.return_value = ([], 0)
+
+    from app.api.deps import get_repository
+
+    async with _client_with_overrides({get_repository: lambda: fake_repo}) as client:
+        response = await client.get(
+            "/users/u1/transactions", params={"from": "2026-01-01T00:00:00"}
+        )
+
+    assert response.status_code == 200
+    _, kwargs = fake_repo.list_user_transactions.call_args
+    assert kwargs["start"] == datetime(2026, 1, 1, tzinfo=UTC)
