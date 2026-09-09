@@ -16,7 +16,10 @@ ROUNDING = ROUND_HALF_EVEN
 def convert_to_usd(amount: Decimal, rate: Decimal) -> Decimal:
     """Convert `amount` to USD at `rate` (USD per 1 unit of the source currency).
 
-    Quantized to cents with `ROUNDING`. Multiplication happens at full Decimal precision and is
-    rounded exactly once, at the end, so no intermediate rounding error accumulates.
+    Quantized to cents with `ROUNDING`, rounded once, at the end, rather than at each step —
+    no intermediate rounding (e.g. rounding `rate` to cents before multiplying) is done.
+    Multiplication itself still runs under Python's default 28-significant-digit decimal
+    context; at the column widths this project uses (amount and rate both well under that),
+    that never affects the result.
     """
     return (amount * rate).quantize(USD_QUANT, rounding=ROUNDING)

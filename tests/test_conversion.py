@@ -45,13 +45,31 @@ def test_no_intermediate_rounding():
 
 
 def test_returns_decimal_not_float():
-    """The result stays Decimal; a float anywhere here would silently lose cents."""
+    """The result stays Decimal, quantized to exactly two decimal places.
+
+    `Decimal("11.0000") == Decimal("11.00")` is True — equality alone can't tell "11.00" from
+    "11.0000" apart, and the scale is exactly what the stored column and the API response
+    actually show. Checking the exponent directly is what makes this assertable at all.
+    """
     result = convert_to_usd(Decimal("10.00"), Decimal("1.10"))
     assert isinstance(result, Decimal)
+    assert result.as_tuple().exponent == -2
 
 
 def test_handles_large_amounts():
-    """Values near the Numeric(18, 4) column limit convert without overflow."""
-    result = convert_to_usd(Decimal("99999999999999.9999"), Decimal("1.0001"))
-    assert result == Decimal("100010000000000.00")
+    """Values near the Numeric(18, 4) column limit convert without overflow.
+
+    9999999999999.9999 (13 integer digits) at a rate just above 1 lands the *result* at
+    exactly 14 integer digits — the column's actual limit. Starting from the column's own max
+    (14 nines) and multiplying by anything over 1 would overflow the result past what
+    Numeric(18, 4) can hold, which is the opposite of what this test claims to prove.
+    """
+    result = convert_to_usd(Decimal("9999999999999.9999"), Decimal("1.0001"))
+    assert result == Decimal("10001000000000.00")
     assert isinstance(result, Decimal)
+
+
+def test_handles_negative_amounts():
+    """Refunds/chargebacks: convert_to_usd has no sign restriction, and Python's
+    ROUND_HALF_EVEN is sign-symmetric — -1 * 0.125 rounds to -0.12, the mirror of 0.12."""
+    assert convert_to_usd(Decimal("-1"), Decimal("0.125")) == Decimal("-0.12")
