@@ -1,0 +1,82 @@
+# app/core/config.py's defaults already point at these exact service names, ports, and
+# credentials — the api/worker/rate-service services below need no `environment:` block at
+# all. Override anything with an APP_-prefixed env var only if you actually need to.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: txn_events
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  rate-service:
+    build: .
+    command: uvicorn rate_service.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import httpx; httpx.get('http://localhost:8000/health', timeout=2).raise_for_status()"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      # Unlike the worker, the API's lifespan has no retry around Postgres/Redis becoming
+      # reachable (see app/main.py's lifespan docstring) — this healthcheck-gated wait is
+      # what actually sequences startup instead. Not gated on rate-service: the API never
+      # talks to it at all (that's the worker's job).
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m app.worker
+    ports:
+      # No fixed host port: a pinned "9100:9100" collides the instant you
+      # `--scale worker=N`, since every replica would fight over the same host port. With just
+      # the container port given, compose assigns each replica its own ephemeral host port —
+      # `docker compose port worker <N> --index <i>` (or `docker compose ps`) shows which one.
+      # app/worker.py isn't an ASGI app, so it can't share the api's /metrics route; this is
+      # its own prometheus_client HTTP server.
+      - "9100"
+    depends_on:
+      # Not gated on rate-service or on `api` finishing create_all: retry_async around the
+      # rate lookup and wait_until_ready's retry-connect loop around Postgres (see
+      # CLAUDE.md's "SQLModel.metadata.create_all runs in the API lifespan only" invariant)
+      # are exactly the mechanism meant to cover both races — gating startup here on top of
+      # that would just hide it instead of letting the demo show it working.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
