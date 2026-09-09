@@ -4,7 +4,7 @@ import asyncio
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="rate-service")
 
@@ -24,7 +24,7 @@ class FaultConfig(BaseModel):
     """How the service should misbehave, for demonstrating the consumer's retry path."""
 
     mode: Literal["ok", "error", "timeout"] = "ok"
-    delay_s: float = 0.0
+    delay_s: float = Field(default=0.0, ge=0)
     """Only used by mode="timeout": how long to sleep before responding. Set this longer than
     the client's own HTTP timeout so the client gives up first — the point is to demonstrate
     the client's timeout handling, not this service's ability to sleep."""
@@ -46,7 +46,7 @@ async def get_rate(currency: str) -> dict[str, str]:
     if _fault.mode == "error":
         raise HTTPException(status_code=500, detail="fault injected: error")
     if _fault.mode == "timeout":
-        await asyncio.sleep(max(0.0, _fault.delay_s))
+        await asyncio.sleep(_fault.delay_s)  # Field(ge=0) already rules out a negative value
 
     rate = RATES.get(currency.upper())
     if rate is None:

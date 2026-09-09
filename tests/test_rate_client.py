@@ -9,7 +9,6 @@ rate_service/ as a real network boundary to fault-inject against, not a mock.
 """
 
 import asyncio
-import socket
 from collections.abc import AsyncIterator
 from decimal import Decimal
 
@@ -20,12 +19,6 @@ import uvicorn
 from app.core.errors import RateServiceUnavailable, UnknownCurrency
 from app.services.rate_client import RateClient
 from rate_service.main import app as rate_service_app
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 async def _set_fault(rate_service_url: str, mode: str, delay_s: float = 0.0) -> None:
@@ -39,12 +32,18 @@ async def rate_service_url() -> AsyncIterator[str]:
 
     A new `uvicorn.Server` per test does *not* imply a fresh `_fault` — it's the same already-
     imported `rate_service.main` module, and its `_fault` global is process-wide, not
-    per-server. Reset it explicitly before yielding, or whichever test last mutated it leaks
-    its fault mode into the next one based on file order.
+    per-server. Reset it explicitly both before yielding (whichever test last mutated it would
+    otherwise leak its fault mode into the next one based on file order) and in `finally` (so
+    the process is left clean for any *other* module that later imports rate_service.main,
+    not just tests in this file).
+
+    port=0 lets the OS assign a free port directly to uvicorn's own bind, rather than binding
+    a throwaway socket first to ask the OS for a free port, closing it, and hoping uvicorn wins
+    the race to rebind the same number before anything else claims it: on a bind failure,
+    uvicorn's serve() logs, shuts down its lifespan, and calls sys.exit() *before* ever setting
+    server.started — so the poll loop below spins forever with nothing to time it out.
     """
-    config = uvicorn.Config(
-        rate_service_app, host="127.0.0.1", port=_free_port(), log_level="warning"
-    )
+    config = uvicorn.Config(rate_service_app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve())
     while not server.started:
@@ -56,6 +55,7 @@ async def rate_service_url() -> AsyncIterator[str]:
     try:
         yield url
     finally:
+        await _set_fault(url, mode="ok")
         server.should_exit = True
         await task
 
@@ -96,12 +96,39 @@ async def test_error_fault_raises_transient_error(rate_client: RateClient, rate_
         await rate_client.get_rate("EUR")
 
 
+async def test_connection_refused_raises_transient_error():
+    """`docker compose stop rate-service` — CLAUDE.md's headline fault-injection demo — is a
+    closed port, not a fault-mode response. No `rate_service_url` fixture here on purpose: a
+    port nothing is listening on needs no server running at all."""
+    async with httpx.AsyncClient(timeout=1.0) as http:
+        client = RateClient(http, base_url="http://127.0.0.1:1", cache_ttl_s=60.0)
+
+        with pytest.raises(RateServiceUnavailable):
+            await client.get_rate("EUR")
+
+
+async def test_health_ignores_fault_state(rate_service_url: str):
+    """A fault demo must not make Docker think the container itself is unhealthy and restart
+    it out from under the demo — /health stays "ok" even mid-fault."""
+    await _set_fault(rate_service_url, mode="error")
+
+    async with httpx.AsyncClient() as http:
+        response = await http.get(f"{rate_service_url}/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 async def test_timeout_fault_raises_transient_error(rate_service_url: str):
     """A short-timeout client of its own, not the shared `http`/`rate_client` fixtures — this
     is the one test that actually cares about timing. The client's timeout is 0.5s; the server
-    is told to sleep for 5s. The client must give up first, over a real socket, not just
-    eventually get an answer."""
-    await _set_fault(rate_service_url, mode="timeout", delay_s=5.0)
+    is told to sleep for 1.5s (3x the client's timeout — comfortable margin without paying for
+    more server-side sleep than needed). The client must give up first, over a real socket, not
+    just eventually get an answer. Teardown waits out the server's in-flight sleep regardless
+    of how soon the client gives up, so this number is directly what this test costs — keep it
+    the smallest value that stays reliably above the client's timeout, not "however long".
+    """
+    await _set_fault(rate_service_url, mode="timeout", delay_s=1.5)
 
     async with httpx.AsyncClient(timeout=0.5) as tight_timeout_http:
         tight_timeout_client = RateClient(
