@@ -10,9 +10,12 @@ caching is the honest trade-off at this scale; N replicas doing N cold fetches i
 would start to earn its place.
 """
 
+import time
 from decimal import Decimal
 
 import httpx
+
+from app.core.errors import RateServiceUnavailable, UnknownCurrency
 
 
 class RateClient:
@@ -41,12 +44,37 @@ class RateClient:
         Only successful lookups are cached. Failures are never negatively cached, so recovery is
         immediate rather than waiting out a TTL.
         """
-        ...
+        cached = self._cached(currency)
+        if cached is not None:
+            return cached
+
+        try:
+            response = await self._http.get(f"{self._base_url}/rates/{currency}")
+        except httpx.RequestError as exc:
+            # Covers every network/timeout failure httpx raises before a response arrives at
+            # all (connection refused, DNS failure, read/connect timeout) — all one hierarchy.
+            raise RateServiceUnavailable(f"rate-service unreachable: {exc}") from exc
+
+        if response.status_code == 404:
+            raise UnknownCurrency(f"no rate for currency {currency!r}")
+        if response.status_code >= 500:
+            raise RateServiceUnavailable(f"rate-service returned {response.status_code}")
+        response.raise_for_status()  # anything else unexpected propagates unclassified
+
+        rate = Decimal(response.json()["rate"])
+        self._store(currency, rate)
+        return rate
 
     def _cached(self, currency: str) -> Decimal | None:
         """Return the rate if present and unexpired, else None."""
-        ...
+        entry = self._cache.get(currency)
+        if entry is None:
+            return None
+        rate, expires_at = entry
+        if time.monotonic() >= expires_at:
+            return None
+        return rate
 
     def _store(self, currency: str, rate: Decimal) -> None:
         """Cache `rate` until now + cache_ttl_s."""
-        ...
+        self._cache[currency] = (rate, time.monotonic() + self._cache_ttl_s)

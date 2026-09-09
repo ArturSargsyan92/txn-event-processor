@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     rate_cache_ttl_s: float = 5.0
     """In-process cache TTL. Short enough that stopping the rate-service shows up quickly."""
 
+    rate_service_timeout_s: float = 2.0
+    """HTTP timeout for a single call to the rate-service. Short: a hung rate-service should
+    surface as a retryable failure quickly, not stall the worker waiting on one request."""
+
     # --- Observability --------------------------------------------------------------
     worker_metrics_port: int = 9100
     log_level: str = "INFO"
