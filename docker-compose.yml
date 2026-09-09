@@ -1,6 +1,11 @@
 # app/core/config.py's defaults already point at these exact service names, ports, and
 # credentials — the api/worker/rate-service services below need no `environment:` block at
 # all. Override anything with an APP_-prefixed env var only if you actually need to.
+#
+# postgres/redis publish no host ports: nothing in the demo needs them (`docker compose exec
+# redis redis-cli ...` / `docker compose exec postgres psql ...` reach them over the compose
+# network already), and pinning 5432/6379 to the host is a startup failure waiting to happen
+# on any machine that already has a local Postgres or Redis running on the default port.
 
 services:
   postgres:
@@ -9,20 +14,23 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: txn_events
-    ports:
-      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # -h 127.0.0.1 matters, not just -U postgres: the official image runs a *temporary*
+      # server over the unix socket only (listen_addresses='') while it applies init scripts,
+      # before starting the real one on TCP. A socket-only `pg_isready` can report healthy
+      # against that temporary server, and since Docker only needs one success to flip
+      # "healthy", `api` (which has no retry of its own around this — see its lifespan
+      # docstring) can start and fail before the real server is actually listening. Forcing
+      # the check over TCP means it only succeeds once the real server is really up.
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
       interval: 2s
       timeout: 3s
       retries: 15
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -34,6 +42,7 @@ services:
     command: uvicorn rate_service.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8001:8000"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
              "import httpx; httpx.get('http://localhost:8000/health', timeout=2).raise_for_status()"]
@@ -46,6 +55,7 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    restart: unless-stopped
     depends_on:
       # Unlike the worker, the API's lifespan has no retry around Postgres/Redis becoming
       # reachable (see app/main.py's lifespan docstring) — this healthcheck-gated wait is
@@ -59,13 +69,15 @@ services:
   worker:
     build: .
     command: python -m app.worker
+    restart: unless-stopped
     ports:
       # No fixed host port: a pinned "9100:9100" collides the instant you
       # `--scale worker=N`, since every replica would fight over the same host port. With just
       # the container port given, compose assigns each replica its own ephemeral host port —
-      # `docker compose port worker <N> --index <i>` (or `docker compose ps`) shows which one.
-      # app/worker.py isn't an ASGI app, so it can't share the api's /metrics route; this is
-      # its own prometheus_client HTTP server.
+      # `docker compose port worker 9100` (add `--index <i>` past the first replica) shows
+      # which one; the README's demo walkthrough uses this to reach a running worker's
+      # /metrics. app/worker.py isn't an ASGI app, so it can't share the api's /metrics route;
+      # this is its own prometheus_client HTTP server.
       - "9100"
     depends_on:
       # Not gated on rate-service or on `api` finishing create_all: retry_async around the

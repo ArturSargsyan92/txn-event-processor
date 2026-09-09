@@ -195,7 +195,10 @@ today's deliberately-simple choices would need to change, roughly in the order t
 ## Demo walkthrough
 
 All of this was run for real against `docker compose up` while building it — not just
-asserted:
+asserted. Start from a clean slate with `docker compose down -v` first if you've run the
+stack before — the Postgres volume persists across `down` on purpose (so `up`/`down` cycles
+don't lose data), which means a repeat dedup check without `-v` starts with `t1` already
+present:
 
 ```bash
 docker compose up --build
@@ -216,6 +219,11 @@ docker compose stop rate-service
 curl -X POST localhost:8000/events -H 'content-type: application/json' \
   -d '{"id":"t2","user_id":"u1","amount":"5.00","currency":"EUR","timestamp":"2026-01-01T00:00:00Z"}'
 docker compose logs worker --tail 20
+#   events_failed{kind="transient"} and consumer_lag live on the worker's own metrics
+#   server (it isn't an ASGI app, so it can't share the api's /metrics route) — its host
+#   port isn't fixed (so `--scale worker=N` below doesn't collide), `docker compose port`
+#   resolves it for the single default replica:
+curl "$(docker compose port worker 9100 | sed 's/0.0.0.0/localhost/')/metrics" | grep -E '^(consumer_lag|events_failed)'
 docker compose start rate-service
 #   within min_idle_ms (~15s), XAUTOCLAIM reclaims the pending message and it processes
 
@@ -231,6 +239,10 @@ docker compose exec redis redis-cli XRANGE transactions:dlq - +
 # horizontal scaling: consumer group needs no code change
 docker compose up -d --scale worker=4
 docker compose exec redis redis-cli XINFO CONSUMERS transactions transaction-processors
+#   consumer_name defaults to the container hostname (app/core/config.py), so repeated
+#   scale up/down cycles within one `docker compose up` session accumulate dead consumer
+#   entries here alongside the live ones — `docker compose down -v` between demo runs
+#   keeps this output limited to the currently-running replicas.
 
 # metrics
 curl -L localhost:8000/metrics    # -L or a trailing slash — bare /metrics 307s (Starlette Mount)
