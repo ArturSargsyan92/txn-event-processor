@@ -12,6 +12,8 @@ from redis.exceptions import RedisError
 
 from app.api.deps import ProducerDep, RedisDep, RepositoryDep
 from app.core.errors import DatabaseUnavailable
+from app.core.metrics import EVENTS_PUBLISHED
+from app.db.errors import DB_EXCEPTIONS
 from app.schemas.events import TransactionEvent, TransactionEventIn
 from app.schemas.responses import AcceptedResponse, TransactionOut, TransactionPage, UserSummary
 
@@ -26,7 +28,16 @@ async def ingest_event(payload: TransactionEventIn, producer: ProducerDep) -> Ac
     yet. Claiming otherwise would be a lie the client could observe.
     """
     event = TransactionEvent(**payload.model_dump(), received_at=datetime.now(UTC))
-    stream_id = await producer.publish(event)
+    try:
+        stream_id = await producer.publish(event)
+    except (OSError, RedisError) as exc:
+        # This is the one path the whole architecture is built around ("queue depth, not
+        # Postgres, absorbs the burst") — a Redis blip here must read as "try again" (503),
+        # the same signal /health/ready already gives for the identical failure, not an
+        # opaque 500 with no retry hint for the client.
+        raise HTTPException(status_code=503, detail=f"queue unavailable: {exc}") from exc
+
+    EVENTS_PUBLISHED.inc()
     return AcceptedResponse(event_id=event.id, stream_id=stream_id)
 
 
@@ -50,7 +61,17 @@ async def user_transactions(
 
     `from` is aliased because it is a Python keyword. The interval is half-open so callers can
     page through adjacent windows without seeing a boundary row twice.
+
+    A `from`/`to` with no UTC offset is treated as UTC, not left ambiguous — otherwise it's
+    silently interpreted in whatever timezone the *database session* happens to be in
+    (confirmed live: with the session in Asia/Yerevan, a naive `13:00` matched a row stored
+    at `09:00Z`), which breaks the half-open guarantee for any caller that omits the offset.
     """
+    if from_ is not None and from_.tzinfo is None:
+        from_ = from_.replace(tzinfo=UTC)
+    if to is not None and to.tzinfo is None:
+        to = to.replace(tzinfo=UTC)
+
     rows, total = await repo.list_user_transactions(
         user_id, start=from_, end=to, limit=limit, offset=offset
     )
@@ -89,7 +110,12 @@ async def readiness(repo: RepositoryDep, redis: RedisDep) -> dict[str, str]:
         # works, not just that a bare connection succeeds. An unknown user is a normal (0, 0)
         # result, not an error, so the user_id itself is a throwaway.
         await repo.user_summary("__healthcheck__")
-    except DatabaseUnavailable as exc:
+    except (DatabaseUnavailable, *DB_EXCEPTIONS) as exc:
+        # Deliberately broader than the read endpoints' own handling (which only maps
+        # DatabaseUnavailable — a genuinely retryable failure — to 503, and lets anything
+        # classify_db_error left unclassified propagate as a real error): a readiness probe's
+        # only job is "can this process serve traffic right now," so a missing table (this
+        # is the one process that runs create_all) means "not ready" too, not a stack trace.
         raise HTTPException(status_code=503, detail=f"database unreachable: {exc}") from exc
 
     return {"status": "ready"}

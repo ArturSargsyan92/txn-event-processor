@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     is what actually sequences — this process failing fast and letting the orchestrator restart
     it is the simpler, equally correct answer to the same problem.
     """
-    settings = Settings()
+    settings = app.state.settings  # set by create_app, before this ever runs
 
     engine = create_engine(settings.database_url)
     await init_models(engine)
@@ -42,7 +42,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis = create_redis(settings.redis_url)
     producer = EventProducer(redis, settings.stream_name, settings.stream_maxlen)
 
-    app.state.settings = settings
     app.state.repository = repository
     app.state.producer = producer
     app.state.redis = redis
@@ -55,10 +54,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    """Build the application: settings, lifespan, routes, and the Prometheus ASGI mount."""
-    configure_logging(Settings().log_level)
+    """Build the application: settings, lifespan, routes, and the Prometheus ASGI mount.
+
+    Settings() is constructed exactly once, here, and stashed on app.state before `lifespan`
+    ever runs (that only happens once uvicorn starts serving) — `lifespan` reads it back
+    rather than building its own second instance, so the whole process has one source of
+    truth for its own config.
+    """
+    settings = Settings()
+    configure_logging(settings.log_level)
 
     app = FastAPI(title="txn-event-processor", lifespan=lifespan)
+    app.state.settings = settings
     app.include_router(router)
     app.mount("/metrics", make_asgi_app())
 

@@ -7,16 +7,41 @@ and the ingest-endpoint tests inspect the raw stream — this file is testing th
 not re-testing dedup or conversion, which already have their own dedicated test files.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import httpx
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.config import Settings
+from app.core.errors import DatabaseUnavailable
 from app.db.models import ProcessedTransaction
 from app.db.repository import TransactionRepository
 from app.schemas.events import StreamEnvelope
+
+
+@asynccontextmanager
+async def _client_with_overrides(overrides: dict) -> AsyncIterator[httpx.AsyncClient]:
+    """A client like the `api_client` fixture, but wired to fakes instead of real infra.
+
+    The health/error-path tests below need Redis or Postgres to actually fail, which the
+    `api_client` fixture's real connections can't do on demand — this builds a one-off client
+    against `app.main.app` with only the given dependencies overridden.
+    """
+    from app.main import app
+
+    app.dependency_overrides.update(overrides)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
 
 
 def _payload(id: str = "t1", **overrides: object) -> dict:
@@ -58,11 +83,13 @@ async def test_post_event_returns_202_and_stream_id(api_client: httpx.AsyncClien
     assert body["stream_id"]
 
 
-async def test_post_event_publishes_envelope_to_stream(api_client: httpx.AsyncClient, redis: Redis):
+async def test_post_event_publishes_envelope_to_stream(
+    api_client: httpx.AsyncClient, redis: Redis, settings: Settings
+):
     response = await api_client.post("/events", json=_payload("t1", amount="42.50", currency="EUR"))
     stream_id = response.json()["stream_id"]
 
-    entries = await redis.xrange("transactions")
+    entries = await redis.xrange(settings.stream_name)
 
     assert len(entries) == 1
     entry_id, fields = entries[0]
@@ -171,3 +198,85 @@ async def test_transactions_ordered_newest_first(
 
     ids = [item["id"] for item in response.json()["items"]]
     assert ids == ["o2", "o1", "o0"]
+
+
+async def test_post_event_normalizes_lowercase_currency(
+    api_client: httpx.AsyncClient, redis: Redis, settings: Settings
+):
+    response = await api_client.post("/events", json=_payload("t1", currency="eur"))
+    stream_id = response.json()["stream_id"]
+
+    entries = await redis.xrange(settings.stream_name)
+    entry_id, fields = entries[0]
+    assert entry_id == stream_id
+    event = StreamEnvelope.from_fields(fields).to_event()
+    assert event.currency == "EUR"
+
+
+async def test_liveness_reports_alive(api_client: httpx.AsyncClient):
+    response = await api_client.get("/health/live")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "alive"}
+
+
+async def test_readiness_reports_ready_when_redis_and_db_are_up(api_client: httpx.AsyncClient):
+    response = await api_client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+async def test_readiness_is_503_when_redis_is_unreachable():
+    dead_redis = AsyncMock()
+    dead_redis.ping.side_effect = RedisError("connection refused")
+
+    from app.api.deps import get_redis, get_repository
+
+    async with _client_with_overrides(
+        {get_redis: lambda: dead_redis, get_repository: lambda: AsyncMock()}
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert "redis unreachable" in response.json()["detail"]
+
+
+async def test_readiness_is_503_when_database_is_unreachable():
+    dead_repo = AsyncMock()
+    dead_repo.user_summary.side_effect = DatabaseUnavailable("connection refused")
+
+    from app.api.deps import get_redis, get_repository
+
+    async with _client_with_overrides(
+        {get_redis: lambda: AsyncMock(), get_repository: lambda: dead_repo}
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert "database unreachable" in response.json()["detail"]
+
+
+async def test_summary_is_503_when_database_is_unavailable():
+    """Distinct from the /health/ready test above: this pins the global exception handler
+    in app/main.py, which is what the two *read* endpoints actually rely on — not the
+    readiness probe's own try/except, which has its own separate error text."""
+    dead_repo = AsyncMock()
+    dead_repo.user_summary.side_effect = DatabaseUnavailable("connection refused")
+
+    from app.api.deps import get_repository
+
+    async with _client_with_overrides({get_repository: lambda: dead_repo}) as client:
+        response = await client.get("/users/u1/summary")
+
+    assert response.status_code == 503
+    assert "database unavailable" in response.json()["detail"]
+
+
+async def test_metrics_endpoint_is_mounted_and_reachable(api_client: httpx.AsyncClient):
+    # Starlette's Mount 307-redirects a bare "/metrics" to "/metrics/" — hit the slash form
+    # directly to test the mount itself rather than the redirect (see CLAUDE.md/finding 3).
+    response = await api_client.get("/metrics/")
+
+    assert response.status_code == 200
+    assert "events_published" in response.text
