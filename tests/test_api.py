@@ -33,21 +33,19 @@ async def _client_with_overrides(overrides: dict) -> AsyncIterator[httpx.AsyncCl
     `api_client` fixture's real connections can't do on demand — this builds a one-off client
     against `app.main.app` with only the given dependencies overridden.
 
-    Restores the *prior* overrides on exit rather than clearing unconditionally: `app.main.app`
-    is a module-global, so an unconditional `.clear()` would silently drop anything an outer
-    `api_client` had already wired up if this were ever nested inside it — restoring is what
-    makes this helper safe to use in isolation regardless of what else is touching the app.
+    None of these tests use `api_client` at the same time (the two are mutually exclusive per
+    test), so a plain `.clear()` on exit is enough — `app.main.app` is a module-global, and
+    `api_client`'s own teardown does the same unconditional clear.
     """
     from app.main import app
 
-    previous = app.dependency_overrides.copy()
     app.dependency_overrides.update(overrides)
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             yield client
     finally:
-        app.dependency_overrides = previous
+        app.dependency_overrides.clear()
 
 
 def _payload(id: str = "t1", **overrides: object) -> dict:
@@ -301,8 +299,11 @@ async def test_post_event_increments_events_published(api_client: httpx.AsyncCli
     missing until the step-8 review-fix commit added `EVENTS_PUBLISHED.inc()`."""
     before = _events_published_total((await api_client.get("/metrics/")).text)
 
-    await api_client.post("/events", json=_payload("metrics-check"))
+    response = await api_client.post("/events", json=_payload("metrics-check"))
 
+    # Asserted explicitly, not just implied by the counter delta below: a regression to 503
+    # would otherwise surface as an opaque "1.0 != 2.0" instead of a clear ingest failure.
+    assert response.status_code == 202
     after = _events_published_total((await api_client.get("/metrics/")).text)
     assert after == before + 1
 
@@ -334,9 +335,11 @@ async def test_transactions_naive_query_bounds_are_treated_as_utc():
 
     async with _client_with_overrides({get_repository: lambda: fake_repo}) as client:
         response = await client.get(
-            "/users/u1/transactions", params={"from": "2026-01-01T00:00:00"}
+            "/users/u1/transactions",
+            params={"from": "2026-01-01T00:00:00", "to": "2026-01-02T00:00:00"},
         )
 
     assert response.status_code == 200
     _, kwargs = fake_repo.list_user_transactions.call_args
     assert kwargs["start"] == datetime(2026, 1, 1, tzinfo=UTC)
+    assert kwargs["end"] == datetime(2026, 1, 2, tzinfo=UTC)

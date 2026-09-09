@@ -39,7 +39,7 @@ async def ingest_event(payload: TransactionEventIn, producer: ProducerDep) -> Ac
         # opaque 500 with no retry hint for the client. Logged server-side too: the 503 alone
         # is visible to the client, but an operator watching a "stop redis" demo has nothing
         # else to look at — EVENTS_PUBLISHED only counts successes.
-        logger.warning("event publish failed: %s", exc, extra={"event_id": event.id})
+        logger.warning("event publish failed", extra={"event_id": event.id, "error": str(exc)})
         raise HTTPException(status_code=503, detail=f"queue unavailable: {exc}") from exc
 
     EVENTS_PUBLISHED.inc()

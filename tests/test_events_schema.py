@@ -6,7 +6,7 @@ app/schemas/events.py) — a naive timestamp must mean the same instant regardle
 process's local timezone, not get silently reinterpreted by it.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.schemas.events import TransactionEventIn
 
@@ -35,7 +35,11 @@ def test_naive_timestamp_is_treated_as_utc():
     assert event.timestamp == datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
 
 
-def test_offset_timestamp_is_left_alone():
+def test_offset_timestamp_keeps_its_own_offset():
+    # datetime equality is instant-based, so comparing against a UTC datetime here would
+    # pass whether or not the validator actually left +02:00 alone (both represent the same
+    # instant) — asserting the offset itself is what actually pins "left alone".
     event = TransactionEventIn(**_payload(timestamp="2026-01-01T13:00:00+02:00"))
 
+    assert event.timestamp.utcoffset() == timedelta(hours=2)
     assert event.timestamp == datetime(2026, 1, 1, 11, 0, tzinfo=UTC)

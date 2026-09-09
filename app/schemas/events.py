@@ -39,9 +39,10 @@ class TransactionEventIn(BaseModel):
         """A timestamp with no UTC offset must not be interpreted in whatever timezone the
         *process* happens to be running in — confirmed live: asyncpg encodes a naive
         `datetime` via `astimezone()`, which assumes local time, so a naive `13:00` accepted
-        here lands in Postgres shifted by the worker container's own clock. Coercing to UTC
-        at the boundary, same rule as `GET /users/{id}/transactions`'s `from`/`to`, means
-        there's exactly one place "naive means UTC" is decided, not two."""
+        here lands in Postgres shifted by the worker container's own clock. This applies the
+        same "naive means UTC" rule that `GET /users/{id}/transactions` applies to its own
+        `from`/`to` query params (routes.py) — those aren't model fields, so they can't share
+        this validator, but the rule itself is the one thing both boundaries agree on."""
         return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
