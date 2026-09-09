@@ -53,6 +53,19 @@ async def test_reraises_after_attempts_exhausted(no_sleep):
     assert len(no_sleep) == 2
 
 
+async def test_attempts_below_one_raises_value_error(no_sleep):
+    """A misconfigured attempts=0 must fail loud and typed — not as the bare
+    AssertionError worker.handle's TransientError/PermanentError branches can't classify."""
+
+    async def fn() -> str:
+        raise AssertionError("must not be called when attempts < 1")
+
+    with pytest.raises(ValueError):
+        await retry_async(fn, attempts=0, base_delay=0.01, max_delay=0.1)
+
+    assert no_sleep == []
+
+
 async def test_permanent_error_is_not_retried(no_sleep):
     calls = {"count": 0}
 
