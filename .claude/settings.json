@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_response.filePath // .tool_input.file_path // empty' 2>/dev/null | { read -r f || exit 0; case \"$f\" in *.py) uv run ruff format \"$f\" ;; esac; } 2>/dev/null || true",
+            "statusMessage": "Formatting with ruff"
+          }
+        ]
+      }
+    ]
+  }
+}
