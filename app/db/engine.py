@@ -6,7 +6,6 @@ retry-connects until the tables exist, which it can already do with `retry_async
 """
 
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -17,6 +16,7 @@ from sqlmodel import SQLModel
 
 from app.core.errors import DatabaseUnavailable
 from app.core.retry import retry_async
+from app.db.errors import DB_EXCEPTIONS
 
 
 def create_engine(database_url: str) -> AsyncEngine:
@@ -46,20 +46,23 @@ async def wait_until_ready(engine: AsyncEngine, *, attempts: int, base_delay: fl
     Probes the real table, not a bare `SELECT 1` — Postgres accepting connections doesn't mean
     the API has created the schema yet, and this function's whole job is to wait for that too.
 
-    Deliberately broad about what counts as "not ready" (any OSError or SQLAlchemyError),
-    unlike TransactionRepository's methods: telling a live operational failure apart from bad
-    data is that class's job; this function's only job is "keep trying until the environment
-    is up," so a missing table belongs in the same bucket as a refused connection.
+    Deliberately broad about what counts as "not ready" (all of DB_EXCEPTIONS, unfiltered —
+    see app/db/errors.py), unlike TransactionRepository's methods: telling a live operational
+    failure apart from bad data is that class's job; this function's only job is "keep trying
+    until the environment is up," so a missing table belongs in the same bucket as a refused
+    connection or Postgres still finishing its own startup.
 
     Runs once, at process startup — the cap is a fixed 5s rather than a Settings knob, since
-    there's nothing here to tune for the fault-injection demo.
+    there's nothing here to tune for the fault-injection demo. Choose `attempts`/`base_delay`
+    generously: this is waiting on a whole other container finishing boot and running
+    create_all, not just a TCP handshake, and can reasonably take several seconds.
     """
 
     async def probe() -> None:
         try:
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1 FROM processed_transactions LIMIT 1"))
-        except (OSError, SQLAlchemyError) as exc:
+        except DB_EXCEPTIONS as exc:
             raise DatabaseUnavailable(str(exc)) from exc
 
     await retry_async(

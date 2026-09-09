@@ -88,7 +88,13 @@ async def test_pagination_and_ordering_are_newest_first(repo: TransactionReposit
 
 async def test_same_timestamp_rows_have_a_stable_total_order(repo: TransactionRepository):
     """Regression: pagination needs a tiebreaker or same-second rows can be skipped or
-    repeated across pages — timestamp alone isn't unique."""
+    repeated across pages — timestamp alone isn't unique.
+
+    Asserts the exact expected order, not just "no id missing or duplicated": a set-equality
+    check here would pass even without the id.desc() tiebreaker, since two identical queries
+    against an unchanging table tend to agree by accident, not by any guarantee. With the
+    tiebreaker, ties break by id descending, so "c","b","a" is the only correct order.
+    """
     ts = datetime(2026, 1, 1, tzinfo=UTC)
     for id_ in ("a", "b", "c"):
         await repo.insert_ignore_duplicate(_txn(id_, timestamp=ts))
@@ -96,8 +102,32 @@ async def test_same_timestamp_rows_have_a_stable_total_order(repo: TransactionRe
     page1, _ = await repo.list_user_transactions("u1", start=None, end=None, limit=2, offset=0)
     page2, _ = await repo.list_user_transactions("u1", start=None, end=None, limit=2, offset=2)
 
-    seen = [row.id for row in page1] + [row.id for row in page2]
-    assert sorted(seen) == ["a", "b", "c"]
+    assert [row.id for row in page1] == ["c", "b"]
+    assert [row.id for row in page2] == ["a"]
+
+
+async def test_another_users_rows_are_excluded(repo: TransactionRepository):
+    """Every other test here only ever inserts user_id='u1' — nothing catches a dropped
+    user_id predicate. This does, by giving one row to a second user."""
+    await repo.insert_ignore_duplicate(_txn("mine", timestamp=datetime(2026, 1, 1, tzinfo=UTC)))
+    await repo.insert_ignore_duplicate(
+        _txn(
+            "theirs",
+            user_id="u2",
+            amount_usd=Decimal("999.00"),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+
+    total, count = await repo.user_summary("u1")
+    rows, list_total = await repo.list_user_transactions(
+        "u1", start=None, end=None, limit=10, offset=0
+    )
+
+    assert count == 1
+    assert total == Decimal("11.00")
+    assert list_total == 1
+    assert [row.id for row in rows] == ["mine"]
 
 
 async def test_timestamp_and_amount_round_trip_precisely(repo: TransactionRepository):

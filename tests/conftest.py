@@ -5,17 +5,18 @@ it needs rather than everything being built up front against interfaces that may
 """
 
 import asyncio
+import os
 import random
 from collections.abc import AsyncIterator
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
 from app.core.config import Settings
 from app.db.engine import create_engine, create_session_factory, init_models
+from app.db.errors import DB_EXCEPTIONS
 
 
 @pytest.fixture
@@ -24,8 +25,19 @@ def settings() -> Settings:
 
     Bypasses `get_settings()`'s cache entirely — constructed directly so each test gets an
     isolated instance regardless of import order.
+
+    `database_url` falls back to a plain localhost URL rather than Settings' own default
+    (docker-compose's `postgres` service + the app's real database) — this fixture drops
+    every table it touches, so that default must never be reachable by accident. Read
+    directly from os.environ rather than left to Settings' own env parsing: passing
+    database_url as a constructor kwarg at all, even conditionally, takes precedence over
+    APP_DATABASE_URL in pydantic-settings' source order, so building the kwarg from the
+    environment ourselves is what keeps the override actually overridable.
     """
     return Settings(
+        database_url=os.environ.get(
+            "APP_DATABASE_URL", "postgresql+asyncpg://postgres@localhost:5432/txn_events_test"
+        ),
         retry_base_delay_s=0.01,
         retry_max_delay_s=0.08,
         rate_attempts=3,
@@ -80,7 +92,7 @@ async def postgres_engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-    except (OSError, SQLAlchemyError) as exc:
+    except DB_EXCEPTIONS as exc:
         await engine.dispose()
         pytest.skip(f"no Postgres reachable at {settings.database_url!r}: {exc}")
 

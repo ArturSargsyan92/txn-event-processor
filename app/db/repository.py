@@ -8,28 +8,40 @@ running or how they interleave.
 from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
+from typing import NoReturn
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.errors import DatabaseUnavailable
+from app.db.errors import DB_EXCEPTIONS, classify_db_error
 from app.db.models import ProcessedTransaction
 
 
 class TransactionRepository:
     """Reads and writes for `processed_transactions`.
 
-    Every method wraps only OperationalError/InterfaceError (SQLAlchemy's names for a dropped
-    or refused connection) and raw OSError as DatabaseUnavailable — deliberately not the
-    broader SQLAlchemyError. A DataError (a value too long for a column) or an IntegrityError
-    (a NOT NULL violation) means the data or the schema is wrong, not the connection; retrying
-    can never fix that, so it propagates unclassified rather than being mislabeled transient.
+    Every method catches DB_EXCEPTIONS broadly, then hands it to classify_db_error: a
+    connection problem re-raises as DatabaseUnavailable (retryable); a data or schema problem
+    (a value too long for a column, a constraint violation) propagates as whatever SQLAlchemy
+    or asyncpg actually raised, unclassified — retrying it can never help. See app/db/errors.py
+    for why this can't be done by Python exception type alone on this driver.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    @staticmethod
+    def _reraise_classified(exc: Exception) -> NoReturn:
+        """Re-raise `exc` as DatabaseUnavailable if it looks retryable, else re-raise it as-is.
+
+        Two separate raises rather than `raise (transient or exc) from exc` — chaining an
+        exception from itself as its own cause is legal but produces a nonsense traceback.
+        """
+        transient = classify_db_error(exc)
+        if transient is not None:
+            raise transient from exc
+        raise exc
 
     async def insert_ignore_duplicate(self, txn: ProcessedTransaction) -> bool:
         """Insert `txn`, doing nothing if its id is already present.
@@ -58,8 +70,8 @@ class TransactionRepository:
                 result = await session.execute(stmt)
                 inserted = result.first() is not None
                 await session.commit()
-        except (OSError, OperationalError, InterfaceError) as exc:
-            raise DatabaseUnavailable(str(exc)) from exc
+        except DB_EXCEPTIONS as exc:
+            self._reraise_classified(exc)
 
         return inserted
 
@@ -78,8 +90,8 @@ class TransactionRepository:
         try:
             async with self._session_factory() as session:
                 total, count = (await session.execute(stmt)).one()
-        except (OSError, OperationalError, InterfaceError) as exc:
-            raise DatabaseUnavailable(str(exc)) from exc
+        except DB_EXCEPTIONS as exc:
+            self._reraise_classified(exc)
 
         return Decimal(total), count
 
@@ -122,7 +134,7 @@ class TransactionRepository:
             async with self._session_factory() as session:
                 rows = (await session.execute(rows_stmt)).scalars().all()
                 total = (await session.execute(count_stmt)).scalar_one()
-        except (OSError, OperationalError, InterfaceError) as exc:
-            raise DatabaseUnavailable(str(exc)) from exc
+        except DB_EXCEPTIONS as exc:
+            self._reraise_classified(exc)
 
         return rows, total
